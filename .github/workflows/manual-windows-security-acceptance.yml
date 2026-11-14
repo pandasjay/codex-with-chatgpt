@@ -1,9 +1,6 @@
 name: Manual Windows security acceptance
 
 on:
-  push:
-    branches:
-      - codex/windows-security-acceptance-20261114
   workflow_dispatch:
 
 permissions:
