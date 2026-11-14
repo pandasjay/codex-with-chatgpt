@@ -1,0 +1,186 @@
+name: Manual Windows security acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-acceptance:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out the selected acceptance commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: acceptance-source
+          persist-credentials: false
+
+      - name: Check out the fixed production commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: e133acb5e865b5d788b670fb8ddc600ce37bbb34
+          path: production
+          persist-credentials: false
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24.22.1
+          package-manager-cache: false
+
+      - name: Set up pinned pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 11.24.0
+          cache: false
+
+      - name: Run security and acceptance gates
+        shell: powershell
+        env:
+          PRODUCTION_SHA: e133acb5e865b5d788b670fb8ddc600ce37bbb34
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $production = Join-Path $env:GITHUB_WORKSPACE 'production'
+          $acceptanceSource = Join-Path $env:GITHUB_WORKSPACE 'acceptance-source'
+
+          $modulePaths = @(
+            (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'),
+            (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules')
+          ) | Where-Object { Test-Path -LiteralPath $_ }
+          if (-not ($modulePaths | Where-Object { $_ -like '*WindowsPowerShell\v1.0\Modules' })) {
+            throw 'Windows PowerShell 5.1 system module directory is missing.'
+          }
+          $env:PSModulePath = $modulePaths -join [IO.Path]::PathSeparator
+          Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+          if ((Get-Command Get-Acl -ErrorAction Stop).Source -ne 'Microsoft.PowerShell.Security') {
+            throw 'Get-Acl did not resolve from Microsoft.PowerShell.Security.'
+          }
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+            throw 'Windows PowerShell 5.1 is required for the DACL checks.'
+          }
+
+          $rgRoot = Join-Path $env:RUNNER_TEMP "c2c-ripgrep-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Path $rgRoot -ErrorAction Stop | Out-Null
+          $rgArchive = Join-Path $rgRoot 'ripgrep.zip'
+          $rgUrl = 'https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip'
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -UseBasicParsing -Uri $rgUrl -OutFile $rgArchive -ErrorAction Stop
+          $rgHash = (Get-FileHash -LiteralPath $rgArchive -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+          if ($rgHash -ne '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5') {
+            throw "Pinned ripgrep SHA-256 mismatch: $rgHash"
+          }
+          Expand-Archive -LiteralPath $rgArchive -DestinationPath $rgRoot -ErrorAction Stop
+          $rgExe = Join-Path $rgRoot 'ripgrep-15.2.0-x86_64-pc-windows-msvc\rg.exe'
+          if (-not (Test-Path -LiteralPath $rgExe)) { throw 'Pinned ripgrep executable is missing.' }
+          $rgVersionOutput = & $rgExe --version
+          $rgExit = $LASTEXITCODE
+          $rgVersion = ([string]$rgVersionOutput[0]).Trim()
+          if ($rgExit -ne 0 -or -not $rgVersion.StartsWith('ripgrep 15.2.0 ')) {
+            throw "Pinned ripgrep version mismatch: $rgVersion"
+          }
+          $env:C2C_RG_PATH = $rgExe
+          Write-Output "Search backend: $rgVersion (SHA-256 $rgHash)"
+
+          $productionHead = (git -C $production rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $productionHead -ne $env:PRODUCTION_SHA) {
+            throw "Production checkout mismatch: expected $env:PRODUCTION_SHA, got $productionHead"
+          }
+          $acceptanceHead = (git -C $acceptanceSource rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $acceptanceHead -ne $env:GITHUB_SHA) {
+            throw "Acceptance checkout mismatch: expected $env:GITHUB_SHA, got $acceptanceHead"
+          }
+
+          $nodeVersion = (node --version).Trim()
+          $nodeExit = $LASTEXITCODE
+          if ($nodeExit -ne 0 -or $nodeVersion -ne 'v24.22.1') { throw "Node.js version mismatch: $nodeVersion" }
+          $pnpmVersion = (pnpm --version).Trim()
+          $pnpmExit = $LASTEXITCODE
+          if ($pnpmExit -ne 0 -or $pnpmVersion -ne '11.24.0') { throw "pnpm version mismatch: $pnpmVersion" }
+          Write-Output "Node.js: $nodeVersion"
+          Write-Output "pnpm: $pnpmVersion"
+
+          Push-Location $production
+          try {
+            pnpm install --frozen-lockfile --registry=https://registry.npmjs.org/
+            if ($LASTEXITCODE -ne 0) { throw "pnpm install failed with exit code $LASTEXITCODE" }
+
+            $failures = [System.Collections.Generic.List[string]]::new()
+            $env:C2C_PRODUCTION_ROOT = $production
+            pnpm exec tsx (Join-Path $acceptanceSource 'acceptance\windows-security-acceptance.ts')
+            $securityExit = $LASTEXITCODE
+            if ($securityExit -ne 0) { $failures.Add("Windows security acceptance exit=$securityExit") }
+
+            $testOutput = & pnpm test 2>&1
+            $testExit = $LASTEXITCODE
+            $testOutput | ForEach-Object { Write-Output $_ }
+            $testSummary = ($testOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+            $testMatch = [regex]::Match($testSummary, 'Tests\s+(?:(?<failed>\d+)\s+failed\s+\|\s+)?(?<passed>\d+)\s+passed\s+\((?<total>\d+)\)')
+            if (-not $testMatch.Success) {
+              $failures.Add("Full Vitest regression summary missing; exit=$testExit")
+            }
+            else {
+              $testPassed = [int]$testMatch.Groups['passed'].Value
+              $testTotal = [int]$testMatch.Groups['total'].Value
+              $testFailed = if ($testMatch.Groups['failed'].Success) { [int]$testMatch.Groups['failed'].Value } else { 0 }
+              Write-Output "Vitest regression: passed=$testPassed failed=$testFailed total=$testTotal exit=$testExit"
+              if ($testExit -ne 0 -or $testPassed -ne 217 -or $testFailed -ne 0 -or $testTotal -ne 217) {
+                $failures.Add("Full Vitest regression did not pass 217/217; exit=$testExit")
+              }
+            }
+
+            pnpm typecheck
+            $typecheckExit = $LASTEXITCODE
+            if ($typecheckExit -ne 0) { $failures.Add("TypeScript check exit=$typecheckExit") }
+
+            pnpm build
+            $buildExit = $LASTEXITCODE
+            if ($buildExit -ne 0) { $failures.Add("Build exit=$buildExit") }
+
+            $auditOutput = & pnpm audit --json --registry=https://registry.npmjs.org/
+            $auditExit = $LASTEXITCODE
+            if ($auditExit -ne 0) {
+              $failures.Add("pnpm audit exit=$auditExit")
+            }
+            else {
+              try {
+                $auditText = ($auditOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+                $audit = $auditText | ConvertFrom-Json -ErrorAction Stop
+                $vulnerabilities = $audit.metadata.vulnerabilities
+                $severity = @('info', 'low', 'moderate', 'high', 'critical')
+                $bad = @($severity | Where-Object { $null -eq $vulnerabilities.$_ -or [int]$vulnerabilities.$_ -ne 0 })
+                if ($bad.Count -gt 0) {
+                  $failures.Add("Audit reported vulnerabilities: $($bad -join ', ')")
+                }
+                else {
+                  Write-Output "Audit: dependencies=$($audit.metadata.totalDependencies) info=0 low=0 moderate=0 high=0 critical=0 exit=$auditExit"
+                }
+              }
+              catch {
+                $failures.Add("Audit JSON/fields invalid: $($_.Exception.GetType().Name)")
+              }
+            }
+
+            git diff --check
+            $diffExit = $LASTEXITCODE
+            if ($diffExit -ne 0) { $failures.Add("git diff --check exit=$diffExit") }
+            $dirty = git status --porcelain=v1 --untracked-files=all
+            $statusExit = $LASTEXITCODE
+            if ($statusExit -ne 0 -or $dirty) { $failures.Add("Production Git status is not clean: $dirty") }
+            $finalHead = (git rev-parse HEAD).Trim()
+            $finalHeadExit = $LASTEXITCODE
+            if ($finalHeadExit -ne 0 -or $finalHead -ne $env:PRODUCTION_SHA) {
+              $failures.Add("Production HEAD changed during acceptance: $finalHead")
+            }
+            Write-Output "Production HEAD: $finalHead"
+            Write-Output "Acceptance workflow commit: $acceptanceHead"
+            if ($failures.Count -gt 0) {
+              throw "Acceptance failed: $($failures -join '; ')"
+            }
+            Write-Output 'Git identity/diff gate: clean'
+          }
+          finally {
+            Pop-Location
+          }
